@@ -92,6 +92,11 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
 #content{position:relative;max-width:34em;margin:0 auto;padding:28px 22px 60vh;font-family:Literata,Georgia,"Times New Roman",serif;
   font-size:24px;line-height:1.8;hyphens:none;-webkit-user-select:none;user-select:none}
 #content p{margin:0 0 .9em}
+#content.pdfmode{max-width:1240px;padding-left:10px;padding-right:10px}
+#words.pdf .pg{position:relative;margin:0 auto 14px;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.15)}
+#words.pdf .pg canvas{display:block}
+#content.pdfmode #band{z-index:3;mix-blend-mode:multiply}
+#content.pdfmode #under{z-index:4}
 #content .w{position:relative;z-index:1;transition:opacity .25s}
 #content.dim .w{opacity:.32}
 #content.dim .w.lit{opacity:1}
@@ -155,6 +160,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <select id="sMode"><option value="line">Line band</option><option value="line+words">Line band + word underline</option><option value="words">Word underline only</option></select>
     <label for="sEye">Eye to follow</label>
     <select id="sEye"><option value="auto">Auto (best at calibration)</option><option value="R">My right eye</option><option value="L">My left eye</option><option value="both">Both eyes</option></select>
+    <label for="sPdf">PDF layout (keep pages, equations, columns)</label><input id="sPdf" type="checkbox">
     <label for="sCal">Calibration style</label>
     <select id="sCal"><option value="read">Read along (like real reading)</option><option value="dots">13 dots</option></select>
     <label for="sDim">Dim other lines</label><input id="sDim" type="checkbox">
@@ -456,9 +462,19 @@ var GR = (function () {
     this.cur = clamp(i, 0, Math.max(0, this.lines.length - 1));
     this._resetLineState(t != null ? t : (this.lastT || 0));
   };
-  LineTracker.prototype.nearestLine = function (y) {
+  // Nearest line to a point. Plain text is sorted top to bottom (binary search); PDF pages with columns are not,
+  // so then it scans all lines and also counts horizontal distance outside the line.
+  LineTracker.prototype.nearestLine = function (y, x) {
     var Ls = this.lines, lo = 0, hi = Ls.length - 1;
     if (hi < 0) return 0;
+    if (Ls._cols && x != null) {
+      var best = 0, bd = Infinity;
+      for (var i = 0; i < Ls.length; i++) {
+        var L = Ls[i], d = Math.abs(y - L.cy) + 0.5 * Math.max(0, L.left - x, x - L.right);
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
     while (lo < hi) { var mid = (lo + hi) >> 1; if (Ls[mid].cy < y) lo = mid + 1; else hi = mid; }
     if (lo > 0 && Math.abs(Ls[lo - 1].cy - y) < Math.abs(Ls[lo].cy - y)) lo--;
     return lo;
@@ -626,7 +642,7 @@ var GR = (function () {
       this.by = clamp(this.by + r * (ey - y), -3 * o.errY - 40, 3 * o.errY + 40);
     }
     // --- far jumps outside the window (skip ahead / back several lines): held vertical offset
-    var sy = this.fy.filter(y, t), kk = this.nearestLine(sy);
+    var sy = this.fy.filter(y, t), kk = this.nearestLine(sy, x);
     var thrLines = Math.max(o.ahead + 1, Math.ceil(o.jumpSigma * o.errY / o.pitch));
     if (Math.abs(kk - this.cur) >= thrLines) {
       if (this.jumpK != null && Math.abs(kk - this.jumpK) <= 1) { if (t - this.jumpT >= o.jumpHold) { this.setCurrent(kk); ev = 'jump'; } }
@@ -667,7 +683,8 @@ var S = {
   dot: store.get('dot', false),
   noise: store.get('noise', 0),
   eye: store.get('eye', 'auto'),
-  calStyle: store.get('calStyle', 'read')
+  calStyle: store.get('calStyle', 'read'),
+  pdfLayout: store.get('pdfLayout', true)
 };
 var MP_VER = '0.10.14';
 var MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
@@ -696,6 +713,7 @@ function toast(msg, ms) {
 
 // ---------- Settings UI ----------
 function bindSettings() {
+  var sp = $('#sPdf'); sp.checked = S.pdfLayout; sp.onchange = function () { S.pdfLayout = sp.checked; store.set('pdfLayout', S.pdfLayout); };
   var cs = $('#sCal'); cs.value = S.calStyle; cs.onchange = function () { S.calStyle = cs.value; store.set('calStyle', S.calStyle); };
   var ey = $('#sEye'); ey.value = S.eye; ey.onchange = function () { S.eye = ey.value; store.set('eye', S.eye); };
   var f = $('#sFont'), g = $('#sGap'), m = $('#sMode'), d = $('#sDim'), sc = $('#sScroll'), dr = $('#sDrift'), dot = $('#sDot'), nz = $('#sNoise');
@@ -716,30 +734,138 @@ function bindSettings() {
 // ---------- Text input ----------
 var textEl = $('#text');
 textEl.value = store.get('text', '');
-textEl.addEventListener('input', function () { store.set('text', textEl.value); });
-$('#sample').onclick = function () { textEl.value = SAMPLE; store.set('text', SAMPLE); };
-$('#clear').onclick = function () { textEl.value = ''; store.set('text', ''); $('#fileStatus').textContent = ''; };
+textEl.addEventListener('input', function () { store.set('text', textEl.value); if (PDF.data) { PDF.data = null; $('#fileStatus').textContent = 'Text edited: using the text, not the PDF pages.'; } });
+$('#sample').onclick = function () { textEl.value = SAMPLE; store.set('text', SAMPLE); PDF.data = null; };
+$('#clear').onclick = function () { textEl.value = ''; store.set('text', ''); $('#fileStatus').textContent = ''; PDF.data = null; };
 $('#file').onchange = async function (e) {
   var file = e.target.files[0]; if (!file) return;
   var st = $('#fileStatus'); st.textContent = 'Reading ' + file.name + '…';
   try {
     var txt;
-    if (/\.pdf$/i.test(file.name) || file.type === 'application/pdf') txt = await pdfToText(await file.arrayBuffer(), function (p, n) { st.textContent = 'Extracting page ' + p + ' of ' + n + '…'; });
-    else txt = await file.text();
+    var isPdf = /\.pdf$/i.test(file.name) || file.type === 'application/pdf';
+    if (isPdf) { var buf = await file.arrayBuffer(); txt = await pdfToText(buf, function (p, n) { st.textContent = 'Extracting page ' + p + ' of ' + n + '…'; }); PDF.data = buf; PDF.name = file.name; }
+    else { txt = await file.text(); PDF.data = null; }
     textEl.value = txt; store.set('text', txt);
-    st.textContent = 'Loaded ' + file.name + ' (' + txt.split(/\s+/).filter(Boolean).length.toLocaleString() + ' words).' + (/\.pdf$/i.test(file.name) ? ' PDF text is re-flowed; equations and figures are dropped.' : '');
+    st.textContent = 'Loaded ' + file.name + ' (' + txt.split(/\s+/).filter(Boolean).length.toLocaleString() + ' words).' +
+      (isPdf ? (S.pdfLayout ? ' It opens as real pages, so equations, tables and columns are kept. (Settings → PDF layout to switch to plain re-flowed text.)' : ' Shown as re-flowed text (equations dropped). Turn on Settings → PDF layout to keep pages as they are.') : '');
   } catch (err) { st.textContent = 'Could not read that file: ' + (err && err.message || err); }
   e.target.value = '';
 };
+// ---------- PDF page mode: real pages (equations, tables, columns kept), lines found from the PDF's text positions ----------
+var PDF = { data: null, name: '', pages: [] };
+async function getPdfLib() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  if (window.__PDFJS_ESM) { // test hook: ESM build of pdf.js
+    var m = await import(window.__PDFJS_ESM); m.GlobalWorkerOptions.workerSrc = window.__PDFJS_WORKER; window.pdfjsLib = m; return m;
+  }
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  return window.pdfjsLib;
+}
+// Text items -> words (positions shared out by character count) -> lines (same baseline, no big gap: a big gap means
+// another column) -> reading order (in two-column stretches: left column, then right column; full-width lines in place).
+function pdfLines(items, vp, lib) {
+  var words = [];
+  items.forEach(function (it) {
+    if (!it.str || !it.str.trim()) return;
+    var tx = lib.Util.transform(vp.transform, it.transform), fh = Math.hypot(tx[2], tx[3]) || 10;
+    if (Math.abs(tx[1]) > 0.05 * fh) return;                       // rotated text (axis labels etc.)
+    var x0 = tx[4], yb = tx[5], w = (it.width || 0) * vp.scale, n = it.str.length, mm, re = /\S+/g;
+    if (!(w > 0)) w = fh * 0.5 * n;
+    while ((mm = re.exec(it.str))) {
+      words.push({ t: mm[0], l: x0 + w * mm.index / n, r: x0 + w * (mm.index + mm[0].length) / n, base: yb, h: fh, top: yb - fh * 0.82, bottom: yb + fh * 0.22 });
+    }
+  });
+  words.sort(function (a, b) { return a.base - b.base || a.l - b.l; });
+  var lines = [];
+  words.forEach(function (w) {
+    var best = null, bd = Infinity;
+    for (var i = lines.length - 1; i >= 0 && i >= lines.length - 40; i--) {
+      var L = lines[i], hh = Math.max(L.h, w.h);
+      if (Math.abs(L.base - w.base) > 0.45 * hh) continue;
+      var gap = w.l - L.right;
+      if (gap > 2.2 * hh || gap < -0.5 * hh) continue;
+      if (Math.abs(gap) < bd) { bd = Math.abs(gap); best = L; }
+    }
+    if (!best) { best = { base: w.base, h: w.h, left: w.l, right: w.r, top: w.top, bottom: w.bottom, words: [] }; lines.push(best); }
+    best.words.push({ t: w.t, l: w.l, r: w.r, cx: (w.l + w.r) / 2, bottom: w.bottom });
+    best.left = Math.min(best.left, w.l); best.right = Math.max(best.right, w.r);
+    best.top = Math.min(best.top, w.top); best.bottom = Math.max(best.bottom, w.bottom); best.h = Math.max(best.h, w.h);
+  });
+  // Superscripts, subscripts, fraction bits: small fragments that sit within a line height of a bigger line join it.
+  var hs = lines.map(function (L) { return L.h; }).sort(function (a, b) { return a - b; }), medH = hs[hs.length >> 1] || 10;
+  lines = lines.filter(function (S) {
+    if (S.words.length > 3 || S.h > 0.85 * medH) return true;
+    var host = null, bd = Infinity, sc = (S.top + S.bottom) / 2;
+    lines.forEach(function (L) {
+      if (L === S || L._gone || L.h <= S.h) return;
+      var dy = Math.abs((L.top + L.bottom) / 2 - sc);
+      if (dy > 0.9 * L.h || S.left > L.right + L.h || S.right < L.left - L.h) return;
+      if (dy < bd) { bd = dy; host = L; }
+    });
+    if (!host) return true;
+    host.words.push.apply(host.words, S.words);
+    host.left = Math.min(host.left, S.left); host.right = Math.max(host.right, S.right);
+    host.top = Math.min(host.top, S.top); host.bottom = Math.max(host.bottom, S.bottom);
+    S._gone = true; return false;
+  });
+  lines.forEach(function (L) { L.words.sort(function (a, b) { return a.l - b.l; }); L.cy = (L.top + L.bottom) / 2; });
+  var W = vp.width, mid = W / 2, n0 = 0, n1 = 0;
+  lines.forEach(function (L) { L.col = L.right < mid + 0.04 * W ? 0 : L.left > mid - 0.04 * W ? 1 : -1; if (L.col === 0) n0++; if (L.col === 1) n1++; });
+  lines.sort(function (a, b) { return a.top - b.top || a.left - b.left; });
+  if (n0 < 4 || n1 < 4) return lines;
+  var out = [], c0 = [], c1 = [];
+  function flush() { out.push.apply(out, c0); out.push.apply(out, c1); c0 = []; c1 = []; }
+  lines.forEach(function (L) { if (L.col === 0) c0.push(L); else if (L.col === 1) c1.push(L); else { flush(); out.push(L); } });
+  flush(); out._cols = true;
+  return out;
+}
+async function buildPdf() {
+  var lib = await getPdfLib();
+  var doc = await lib.getDocument({ data: PDF.data.slice(0) }).promise;
+  wordsEl.innerHTML = ''; wordsEl.classList.add('pdf'); content.classList.add('pdfmode');
+  var width = Math.min(wordsEl.clientWidth || 600, 1200), wi = 0, cols = false;
+  PDF.pages = []; textHash = 'pdf:' + PDF.name + ':' + PDF.data.byteLength;
+  for (var p = 1; p <= doc.numPages; p++) {
+    var page = await doc.getPage(p), vp = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+    var div = document.createElement('div'); div.className = 'pg'; div.style.width = vp.width + 'px'; div.style.height = vp.height + 'px';
+    var cv = document.createElement('canvas'); div.appendChild(cv); wordsEl.appendChild(div);
+    var tc = await page.getTextContent(), lines = pdfLines(tc.items, vp, lib);
+    if (lines._cols) cols = true;
+    lines.forEach(function (L) { L.first = wi; wi += L.words.length; });
+    PDF.pages.push({ div: div, cv: cv, page: page, vp: vp, lines: lines, done: false });
+  }
+  PDF.cols = cols; WORDCOUNT = wi;
+  var io = new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) renderPdfPage(e.target._pg); }); }, { root: readerEl, rootMargin: '1200px 0px' });
+  PDF.pages.forEach(function (pg) { pg.div._pg = pg; io.observe(pg.div); });
+  if (!wi) toast('This PDF has no text layer (a scan?), so lines can\'t be found. Try a PDF with selectable text.', 6000);
+}
+function renderPdfPage(pg) {
+  if (pg.done) return; pg.done = true;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2.5), vp = pg.page.getViewport({ scale: pg.vp.scale * dpr });
+  pg.cv.width = Math.floor(vp.width); pg.cv.height = Math.floor(vp.height);
+  pg.cv.style.width = pg.vp.width + 'px'; pg.cv.style.height = pg.vp.height + 'px';
+  pg.page.render({ canvasContext: pg.cv.getContext('2d'), canvas: pg.cv, viewport: vp });
+}
+function pdfComputeLines() {
+  var cr = content.getBoundingClientRect(), out = [];
+  PDF.pages.forEach(function (pg) {
+    var r = pg.div.getBoundingClientRect(), ox = r.left - cr.left, oy = r.top - cr.top;
+    pg.lines.forEach(function (L) {
+      out.push({ left: L.left + ox, right: L.right + ox, top: L.top + oy, bottom: L.bottom + oy, cy: L.cy + oy, first: L.first, h: L.h,
+        words: L.words.map(function (w) { return { t: w.t, l: w.l + ox, r: w.r + ox, cx: w.cx + ox, bottom: w.bottom + oy }; }) });
+    });
+  });
+  if (PDF.cols) out._cols = true;
+  return out;
+}
+function pdfMode() { return !!(PDF.data && S.pdfLayout); }
 function loadScript(src) {
   return new Promise(function (res, rej) { var s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = function () { rej(new Error('failed to load ' + src)); }; document.head.appendChild(s); });
 }
 async function pdfToText(buf, prog) {
-  if (!window.pdfjsLib) {
-    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  }
-  var doc = await window.pdfjsLib.getDocument({ data: buf }).promise, paras = [], para = '';
+  var lib = await getPdfLib();
+  var doc = await lib.getDocument({ data: buf.slice(0) }).promise, paras = [], para = '';
   for (var p = 1; p <= doc.numPages; p++) {
     prog && prog(p, doc.numPages);
     var page = await doc.getPage(p), tc = await page.getTextContent(), lines = [], cur = null;
@@ -786,9 +912,10 @@ function applyStyle() {
   content.classList.toggle('dim', !!S.dim);
   $('#gazeDot').style.display = S.dot && phase === 'read' ? 'block' : 'none';
   if (tracker) { tracker.o.drift = S.drift; }
-  if (phase === 'read') { relayout(); }
+  if (phase === 'read' && !pdfMode()) { relayout(); }
 }
 function computeLines() {
+  if (pdfMode() && PDF.pages.length) return pdfComputeLines();
   var cr = content.getBoundingClientRect(), spans = wordsEl.querySelectorAll('.w'), lines = [], cur = null;
   for (var i = 0; i < spans.length; i++) {
     var r = spans[i].getBoundingClientRect(), top = r.top - cr.top, l = r.left - cr.left, rr = r.right - cr.left, h = r.height;
@@ -806,11 +933,16 @@ function relayout() {
   var keepFirst = LINES.length && tracker ? LINES[tracker.cur].first : null;
   LINES = computeLines();
   if (tracker) {
-    tracker.o.pitch = S.fontSize * S.lineGap;
+    tracker.o.pitch = linePitch();
     tracker.setLines(LINES);
     if (keepFirst != null) tracker.setCurrent(lineOfWord(keepFirst));
     litLine = -1; render();
   }
+}
+function linePitch() {
+  if (!pdfMode() || LINES.length < 3) return S.fontSize * S.lineGap;
+  var d = []; for (var i = 1; i < LINES.length; i++) { var g = LINES[i].cy - LINES[i - 1].cy; if (g > 0) d.push(g); }
+  return d.length ? GR.median(d) : 20;
 }
 function lineOfWord(w) { for (var i = LINES.length - 1; i >= 0; i--) if (LINES[i].first <= w) return i; return 0; }
 
@@ -1083,15 +1215,19 @@ function makeTracker() {
   }
   tracker = new GR.HmmTracker(o);
 }
-function enterReader() {
+async function enterReader() {
   var txt = textEl.value.trim() || SAMPLE;
   if (!textEl.value.trim()) { textEl.value = SAMPLE; store.set('text', SAMPLE); }
   phase = 'read'; paused = false; show('reader');
   if (mode === 'cam' && !mock && stream) $('#vidHold').appendChild(video);
-  buildText(txt); applyStyle();
+  wordsEl.classList.remove('pdf'); content.classList.remove('pdfmode');
+  if (pdfMode()) {
+    applyStyle();
+    try { await buildPdf(); } catch (e) { toast('Could not open the PDF pages (' + (e && e.message || e) + '). Showing text instead.', 5000); PDF.data = null; buildText(txt); }
+  } else { buildText(txt); applyStyle(); }
   makeTracker();
   var go = function () {
-    LINES = computeLines(); tracker.setLines(LINES);
+    LINES = computeLines(); tracker.o.pitch = linePitch(); tracker.setLines(LINES);
     var pos = store.get('pos', null);
     if (pos && pos.h === textHash) tracker.setCurrent(lineOfWord(pos.w));
     var L = LINES[tracker.cur];
@@ -1099,7 +1235,7 @@ function enterReader() {
     litLine = -1; render(); status();
   };
   go();
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { if (phase === 'read') relayout(); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { if (phase === 'read' && !pdfMode()) relayout(); });
   var portraitPhone = isPhone && window.innerHeight > window.innerWidth;
   toast(mode === 'sim' ? 'Mouse/finger mode: move the pointer along the lines as if it were your eyes.' :
     portraitPhone ? 'Tip: turn the phone sideways (and recalibrate). Longer lines track far better.' : 'Just read. Tap a line if the highlight is off.', 4500);
@@ -1114,7 +1250,7 @@ function readStep(g, t) {
 }
 function render() {
   if (!tracker || !LINES.length) return;
-  var L = LINES[tracker.cur], pitch = S.fontSize * S.lineGap, pad = S.fontSize * 0.35;
+  var L = LINES[tracker.cur], pitch = L.h ? (L.bottom - L.top) * 1.35 : S.fontSize * S.lineGap, pad = L.h ? L.h * 0.3 : S.fontSize * 0.35;
   if (S.mode !== 'words') {
     band.style.display = 'block';
     band.style.width = (L.right - L.left + 2 * pad) + 'px'; band.style.height = pitch + 'px';
@@ -1127,8 +1263,8 @@ function render() {
     under.style.transform = 'translate(' + A.l + 'px,' + (A.bottom + 1) + 'px)';
   } else under.style.display = 'none';
   if (litLine !== tracker.cur) {
-    if (litLine >= 0 && LINES[litLine]) LINES[litLine].words.forEach(function (x) { x.el.classList.remove('lit'); });
-    L.words.forEach(function (x) { x.el.classList.add('lit'); });
+    if (litLine >= 0 && LINES[litLine]) LINES[litLine].words.forEach(function (x) { if (x.el) x.el.classList.remove('lit'); });
+    L.words.forEach(function (x) { if (x.el) x.el.classList.add('lit'); });
     litLine = tracker.cur;
     store.set('pos', { h: textHash, w: L.first });
   }
@@ -1191,7 +1327,7 @@ $('#bRecal').onclick = function () {
 content.addEventListener('click', function (e) {
   if (mode === 'sim' || !tracker) return;
   var cr = content.getBoundingClientRect();
-  tracker.setCurrent(tracker.nearestLine(e.clientY - cr.top)); render(); status();
+  tracker.setCurrent(tracker.nearestLine(e.clientY - cr.top, e.clientX - cr.left)); render(); status();
 });
 function setPtr(x, y) { simPtr = { x: x, y: y }; }
 readerEl.addEventListener('pointermove', function (e) { if (mode === 'sim') setPtr(e.clientX, e.clientY); });
@@ -1216,7 +1352,8 @@ window.addEventListener('resize', function () {
   clearTimeout(rzT);
   rzT = setTimeout(function () {
     if (phase !== 'read') return;
-    relayout();
+    if (pdfMode()) { var keep = LINES.length ? LINES[tracker.cur].first : 0; buildPdf().then(function () { LINES = computeLines(); tracker.o.pitch = linePitch(); tracker.setLines(LINES); tracker.setCurrent(lineOfWord(keep)); litLine = -1; render(); }); }
+    else relayout();
     var c = store.get('calib', null);
     if (mode === 'cam' && c && (Math.abs(c.vw - window.innerWidth) > 40 || Math.abs(c.vh - window.innerHeight) > 120)) toast('Window size changed. Recalibrate for best accuracy.', 4000);
   }, 200);
