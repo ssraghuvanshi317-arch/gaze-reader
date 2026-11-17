@@ -109,5 +109,14 @@ with sync_playwright() as p:
         n += 1; ok += st['t'] == st['r']
         if i == 60: pg.screenshot(path=OUT + '_read.png')
     print(f'reading: tracker on the true line {100*ok/n:.0f}% of samples; ended tracker line {st["t"]} vs true {st["r"]}')
+    # recording: a tap correction, then export
+    pg.click('#content', position={'x': 200, 'y': 300}); pg.wait_for_timeout(300)
+    pg.click('#bHome'); pg.wait_for_timeout(800)
+    print('recorded:', pg.inner_text('#recInfo'))
+    with pg.expect_download() as dl:
+        pg.click('#recExport')
+    path = dl.value.path(); data = json.load(open(path))
+    s0 = data['sessions'][0]
+    print('export:', dl.value.suggested_filename, '| frames', len(s0['frames']), '| events', [e['type'] for e in s0['events']], '| calib samples', len(s0['calib']['samples']), '| model', s0['model']['mode'])
     print('errors:', errors[:10])
     b.close()

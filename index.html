@@ -83,7 +83,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
 #cdot.shrink{animation:shrink 1.1s ease-in forwards}
 @keyframes shrink{from{scale:1.6}to{scale:.45}}
 #cread{position:absolute;inset:0;display:none;font-family:Literata,Georgia,serif;line-height:1.5}
-#cread .cline{position:absolute;left:5%;right:5%;white-space:nowrap;overflow:hidden;color:var(--muted)}
+#cread .cline{position:absolute;left:5%;right:5%;white-space:nowrap;overflow:hidden;color:var(--muted);display:flex;justify-content:space-between;gap:.3em}
 #cread span{border-radius:5px;padding:0 1px;transition:background .08s}
 #cread span.on{background:var(--accent);color:var(--accent-ink)}
 #cprog{position:absolute;left:0;bottom:0;height:3px;background:var(--accent);width:0;transition:width .3s}
@@ -151,6 +151,13 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
    <p class="note">Camera frames are processed on this device and never leave it. "Mouse / finger" mode lets you test the highlighting without the camera: your pointer stands in for your eyes.</p>
   </section>
 
+  <section class="card">
+   <label class="lbl">Your recorded data</label>
+   <p class="note" id="recInfo" style="margin-top:0">–</p>
+   <div class="row"><button class="btn" id="recExport" disabled>Export (share to Drive)</button><button class="btn ghost" id="recClear" disabled>Delete</button></div>
+   <p class="note">Camera sessions record numbers only (eye positions, the gaze estimate, the line chosen, and your corrections), never video. Everything stays on this device until you export it.</p>
+  </section>
+
   <details class="card" id="settingsCard">
    <summary>Settings</summary>
    <div class="set">
@@ -160,6 +167,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <select id="sMode"><option value="line">Line band</option><option value="line+words">Line band + word underline</option><option value="words">Word underline only</option></select>
     <label for="sEye">Eye to follow</label>
     <select id="sEye"><option value="auto">Auto (best at calibration)</option><option value="R">My right eye</option><option value="L">My left eye</option><option value="both">Both eyes</option></select>
+    <label for="sRec">Record camera sessions (numbers only)</label><input id="sRec" type="checkbox">
     <label for="sPdf">PDF layout (keep pages, equations, columns)</label><input id="sPdf" type="checkbox">
     <label for="sCal">Calibration style</label>
     <select id="sCal"><option value="read">Read along (like real reading)</option><option value="dots">13 dots</option></select>
@@ -684,7 +692,8 @@ var S = {
   noise: store.get('noise', 0),
   eye: store.get('eye', 'auto'),
   calStyle: store.get('calStyle', 'read'),
-  pdfLayout: store.get('pdfLayout', true)
+  pdfLayout: store.get('pdfLayout', true),
+  rec: store.get('rec', true)
 };
 var MP_VER = '0.10.14';
 var MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
@@ -713,6 +722,7 @@ function toast(msg, ms) {
 
 // ---------- Settings UI ----------
 function bindSettings() {
+  var sr = $('#sRec'); sr.checked = S.rec; sr.onchange = function () { S.rec = sr.checked; store.set('rec', S.rec); };
   var sp = $('#sPdf'); sp.checked = S.pdfLayout; sp.onchange = function () { S.pdfLayout = sp.checked; store.set('pdfLayout', S.pdfLayout); };
   var cs = $('#sCal'); cs.value = S.calStyle; cs.onchange = function () { S.calStyle = cs.value; store.set('calStyle', S.calStyle); };
   var ey = $('#sEye'); ey.value = S.eye; ey.onchange = function () { S.eye = ey.value; store.set('eye', S.eye); };
@@ -934,7 +944,7 @@ function relayout() {
   LINES = computeLines();
   if (tracker) {
     tracker.o.pitch = linePitch();
-    tracker.setLines(LINES);
+    tracker.setLines(LINES); recLayout();
     if (keepFirst != null) tracker.setCurrent(lineOfWord(keepFirst));
     litLine = -1; render();
   }
@@ -1034,8 +1044,95 @@ function onResult(res, t) {
     if (F.blink > 0.5) return;
     var g = GR.distanceFix(model, F, GR.predictGaze(model, F));
     readStep(g, t);
+    recFrame(t, F, g, lastOut);
     checkMoved(F, t);
   }
+}
+
+
+// ---------- Recording: numbers only (no camera images), kept on this device until you export ----------
+// Each camera reading session stores per-frame eye features (both eyes separately), the gaze estimate, what the
+// tracker decided, and every correction you make (taps, arrows, Fix). Corrections are ground truth for tuning.
+var REC = { sess: null, lastCal: null, saveT: 0 };
+function r4(v) { return Math.round(v * 1e4) / 1e4; }
+var idb = {
+  open: function () {
+    return new Promise(function (res, rej) {
+      try {
+        var q = indexedDB.open('gaze-reader', 1);
+        q.onupgradeneeded = function () { q.result.createObjectStore('sessions', { keyPath: 'id' }); };
+        q.onsuccess = function () { res(q.result); }; q.onerror = function () { rej(q.error); };
+      } catch (e) { rej(e); }
+    });
+  },
+  tx: function (mode, fn) {
+    return idb.open().then(function (db) {
+      return new Promise(function (res, rej) {
+        var t = db.transaction('sessions', mode), st = t.objectStore('sessions'), out = fn(st);
+        t.oncomplete = function () { res(out && out.result !== undefined ? out.result : out); }; t.onerror = function () { rej(t.error); };
+      });
+    });
+  },
+  put: function (o) { return idb.tx('readwrite', function (st) { st.put(o); }); },
+  all: function () { return idb.tx('readonly', function (st) { return st.getAll(); }); },
+  clear: function () { return idb.tx('readwrite', function (st) { st.clear(); }); }
+};
+function recStart() {
+  if (!S.rec || mode !== 'cam') { REC.sess = null; return; }
+  var sz = frameSize();
+  REC.sess = {
+    v: 1, id: 's' + Date.now().toString(36), started: new Date().toISOString(), exported: false,
+    device: { ua: navigator.userAgent, screen: [screen.width, screen.height], dpr: window.devicePixelRatio, view: [innerWidth, innerHeight], video: [sz.W, sz.H] },
+    settings: JSON.parse(JSON.stringify(S)), pdf: pdfMode() ? PDF.name : null, calib: REC.lastCal,
+    model: model ? { mode: model.mode, err: [model.x.err, model.y.err], jit: [model.x.jit, model.y.jit], compare: model.compare, pairing: model.pairing } : null,
+    frameCols: ['t', 'scrollTop', 'gx', 'gy', 'line', 'word', 'blink', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v'],
+    layout: [], frames: [], events: []
+  };
+  recLayout();
+}
+function recLayout() {
+  if (!REC.sess) return;
+  REC.sess.layout.push({ t: r4(performance.now() / 1000), lines: LINES.map(function (L) { return [r4(L.cy), r4(L.left), r4(L.right), L.words.length, L.first]; }) });
+}
+function recFrame(t, F, g, out) {
+  var R = REC.sess; if (!R || !F || !F.modes) return;
+  var a = F.modes['R+bR'], b = F.modes['L+bL'];
+  R.frames.push([r4(t), Math.round(readerEl.scrollTop), r4(g.x), r4(g.y), out ? out.line : -1, out ? out.word : -1, r4(F.blink)]
+    .concat(a.map(r4), b.slice(0, 5).map(r4)));
+  if (t - REC.saveT > 15) { REC.saveT = t; recSave(); }
+}
+function recEvent(type, data) {
+  if (!REC.sess) return;
+  REC.sess.events.push(Object.assign({ t: r4(performance.now() / 1000), type: type, line: tracker ? tracker.cur : -1 }, data || {}));
+}
+function recSave() { if (REC.sess && REC.sess.frames.length) idb.put(REC.sess).catch(function () {}); }
+function recCalib(samples) {
+  REC.lastCal = {
+    t: new Date().toISOString(), style: S.calStyle, view: [cal.W, cal.H],
+    cols: ['pid', 'x', 'y', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v'],
+    samples: samples.map(function (s2) { return [s2.pid, r4(s2.x), r4(s2.y)].concat(s2.modes['R+bR'].map(r4), s2.modes['L+bL'].slice(0, 5).map(r4)); })
+  };
+}
+async function recRefresh() {
+  try {
+    var all = await idb.all(), n = all.length, bytes = all.reduce(function (a, x) { return a + JSON.stringify(x).length; }, 0);
+    var mins = all.reduce(function (a, x) { var f = x.frames; return a + (f.length ? f[f.length - 1][0] - f[0][0] : 0) / 60; }, 0);
+    $('#recInfo').textContent = n ? n + ' session' + (n > 1 ? 's' : '') + ', ' + mins.toFixed(1) + ' min of reading, ' + (bytes / 1e6).toFixed(1) + ' MB' : 'Nothing recorded yet.';
+    $('#recExport').disabled = !n; $('#recClear').disabled = !n;
+  } catch (e) { $('#recInfo').textContent = 'Storage not available in this browser mode.'; }
+}
+async function recExport() {
+  recSave();
+  var all = await idb.all();
+  var blob = new Blob([JSON.stringify({ app: 'gaze-reader', exported: new Date().toISOString(), sessions: all })], { type: 'application/json' });
+  var name = 'gaze-reader-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.json';
+  var file = new File([blob], name, { type: 'application/json' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); toast('Shared. Pick Google Drive (or Files) in the share sheet.'); return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  toast('Downloaded ' + name);
 }
 
 // ---------- Setup screen ----------
@@ -1082,10 +1179,9 @@ function calibBegin() {
     CAL_LINES.forEach(function (fy, li) {
       var line = document.createElement('div'); line.className = 'cline'; box.appendChild(line);
       var spans = [];
-      while (true) {
+      while (spans.length < 8) {   // at most 8 words per line, spread edge to edge: ~25 s in total
         var sp = document.createElement('span'); sp.textContent = words[wi % words.length]; line.appendChild(sp);
-        line.appendChild(document.createTextNode(' '));
-        if (line.scrollWidth > line.clientWidth + 1) { line.removeChild(line.lastChild); line.removeChild(sp); break; }
+        if (line.scrollWidth > line.clientWidth + 1) { line.removeChild(sp); break; }
         spans.push(sp); wi++;
       }
       var lh = line.getBoundingClientRect().height;
@@ -1147,6 +1243,7 @@ function calibFinish() {
     $('#calibRead').disabled = true; return;
   }
   model = GR.calibrate(keep, S.eye);
+  recCalib(keep);
   headRef = {
     cx: GR.median(cal.heads.map(function (h) { return h.cx; })),
     cy: GR.median(cal.heads.map(function (h) { return h.cy; })),
@@ -1233,6 +1330,7 @@ async function enterReader() {
     var L = LINES[tracker.cur];
     if (L) readerEl.scrollTop = Math.max(0, L.cy - readerEl.clientHeight * 0.3);
     litLine = -1; render(); status();
+    recStart();
   };
   go();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { if (phase === 'read' && !pdfMode()) relayout(); });
@@ -1314,11 +1412,11 @@ $('#calibStart').onclick = function () { calibBegin(); };
 $('#calibCancel').onclick = function () { phase = 'setup'; show('setup'); $('#camBox').appendChild(video); };
 $('#calibRedo').onclick = function () { calibBegin(); };
 $('#calibRead').onclick = function () { enterReader(); };
-$('#bHome').onclick = function () { phase = 'home'; show('home'); $('#gazeDot').style.display = 'none'; };
-$('#bUp').onclick = function () { tracker.setCurrent(tracker.cur - 1); render(); status(); };
-$('#bDown').onclick = function () { tracker.setCurrent(tracker.cur + 1); render(); status(); };
-$('#bPause').onclick = function () { paused = !paused; $('#bPause').textContent = paused ? 'Resume' : 'Pause'; status(); };
-$('#bFix').onclick = quickFix;
+$('#bHome').onclick = function () { recEvent('exit'); recSave(); REC.sess = null; phase = 'home'; show('home'); $('#gazeDot').style.display = 'none'; recRefresh(); };
+$('#bUp').onclick = function () { recEvent('up'); tracker.setCurrent(tracker.cur - 1); render(); status(); };
+$('#bDown').onclick = function () { recEvent('down'); tracker.setCurrent(tracker.cur + 1); render(); status(); };
+$('#bPause').onclick = function () { paused = !paused; recEvent(paused ? 'pause' : 'resume'); recSave(); $('#bPause').textContent = paused ? 'Resume' : 'Pause'; status(); };
+$('#bFix').onclick = function () { recEvent('fix'); quickFix(); };
 $('#bRecal').onclick = function () {
   if (mode !== 'cam') { toast('Calibration is only for camera mode'); return; }
   calibIntro(); phase = 'calib'; show('calib'); $('#calibMsg').hidden = false; $('#calibRes').hidden = true; $('#cprog').style.width = '0';
@@ -1326,8 +1424,9 @@ $('#bRecal').onclick = function () {
 // tap / click a line to set position (camera mode). In pointer mode the pointer *is* the gaze.
 content.addEventListener('click', function (e) {
   if (mode === 'sim' || !tracker) return;
-  var cr = content.getBoundingClientRect();
-  tracker.setCurrent(tracker.nearestLine(e.clientY - cr.top, e.clientX - cr.left)); render(); status();
+  var cr = content.getBoundingClientRect(), k = tracker.nearestLine(e.clientY - cr.top, e.clientX - cr.left);
+  recEvent('tap', { to: k, x: r4(e.clientX - cr.left), y: r4(e.clientY - cr.top) });
+  tracker.setCurrent(k); render(); status();
 });
 function setPtr(x, y) { simPtr = { x: x, y: y }; }
 readerEl.addEventListener('pointermove', function (e) { if (mode === 'sim') setPtr(e.clientX, e.clientY); });
@@ -1340,6 +1439,7 @@ readerEl.addEventListener('wheel', function () { userScrollT = performance.now()
 document.addEventListener('keydown', function (e) {
   if (phase !== 'read' || e.target.tagName === 'TEXTAREA') return;
   var k = e.key.toLowerCase();
+  if (/^(arrowdown|j|arrowup|k|f)$/.test(k)) recEvent('key', { key: k });
   if (k === 'arrowdown' || k === 'j') { tracker.setCurrent(tracker.cur + 1); render(); e.preventDefault(); }
   else if (k === 'arrowup' || k === 'k') { tracker.setCurrent(tracker.cur - 1); render(); e.preventDefault(); }
   else if (k === ' ') { $('#bPause').click(); e.preventDefault(); }
@@ -1358,7 +1458,13 @@ window.addEventListener('resize', function () {
     if (mode === 'cam' && c && (Math.abs(c.vw - window.innerWidth) > 40 || Math.abs(c.vh - window.innerHeight) > 120)) toast('Window size changed. Recalibrate for best accuracy.', 4000);
   }, 200);
 });
-document.addEventListener('visibilitychange', function () { if (document.hidden && phase === 'read' && !paused) $('#bPause').click(); });
+document.addEventListener('visibilitychange', function () { if (document.hidden && phase === 'read' && !paused) $('#bPause').click(); if (document.hidden) recSave(); });
+$('#recExport').onclick = recExport;
+$('#recClear').onclick = async function () {
+  if (!$('#recClear').dataset.armed) { $('#recClear').dataset.armed = '1'; $('#recClear').textContent = 'Tap again to delete'; setTimeout(function () { delete $('#recClear').dataset.armed; $('#recClear').textContent = 'Delete'; }, 3000); return; }
+  await idb.clear(); delete $('#recClear').dataset.armed; $('#recClear').textContent = 'Delete'; recRefresh();
+};
+recRefresh();
 
 bindSettings(); applyStyle();
 requestAnimationFrame(loop);
