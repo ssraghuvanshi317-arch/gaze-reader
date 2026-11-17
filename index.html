@@ -149,6 +149,8 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <label for="sGap">Line spacing</label><span><input id="sGap" type="range" min="1.3" max="2.8" step="0.05"><output id="oGap"></output></span>
     <label for="sMode">Highlight</label>
     <select id="sMode"><option value="line">Line band</option><option value="line+words">Line band + word underline</option><option value="words">Word underline only</option></select>
+    <label for="sEye">Eye to follow</label>
+    <select id="sEye"><option value="auto">Auto (best at calibration)</option><option value="R">My right eye</option><option value="L">My left eye</option><option value="both">Both eyes</option></select>
     <label for="sDim">Dim other lines</label><input id="sDim" type="checkbox">
     <label for="sScroll">Auto-scroll</label><input id="sScroll" type="checkbox">
     <label for="sDrift">Auto drift correction</label><input id="sDrift" type="checkbox">
@@ -165,6 +167,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
    <ul>
     <li><b>Tap or click any line</b> to put the highlight there. Keys: <span class="kbd">↓/J</span> next line, <span class="kbd">↑/K</span> previous, <span class="kbd">Space</span> pause, <span class="kbd">F</span> quick fix.</li>
     <li>If you move your head or the device, tap <b>Fix</b> (look at one dot) or recalibrate.</li>
+    <li>If your eyes don't point at the same place (a turned or weak eye), leave <b>Eye to follow</b> on Auto: calibration tests each eye on its own and follows the one that tracks the dots. Calibrate with the eye you read with doing the looking.</li>
     <li>Long lines track best. On a phone, <b>turn it sideways</b>; on a laptop, keep the window wide.</li>
     <li>Best results: light on your face (not behind you), device steady, camera at eye level.</li>
     <li>The word underline is approximate: it shows the rough area of the line you're on, not a precise word.</li>
@@ -277,13 +280,22 @@ var GR = (function () {
     function g(k) { return bs[k] || 0; }
     var ro = p(IDX.rOut), lo = p(IDX.lOut), n = p(IDX.nose);
     var io = Math.hypot(lo.x - ro.x, lo.y - ro.y) || 1e-6, cx = (ro.x + lo.x) / 2, cy = (ro.y + lo.y) / 2;
-    var f = [
-      (R.u + L.u) / 2, (R.v + L.v) / 2, (R.lid + L.lid) / 2,
-      (g('eyeLookInRight') + g('eyeLookOutLeft')) - (g('eyeLookOutRight') + g('eyeLookInLeft')),
-      (g('eyeLookDownLeft') + g('eyeLookDownRight')) - (g('eyeLookUpLeft') + g('eyeLookUpRight')),
-      (n.x - cx) / io, (n.y - cy) / io, cx / W, cy / H, io / W
-    ];
-    return { f: f, blink: Math.max(g('eyeBlinkLeft'), g('eyeBlinkRight')), head: { cx: cx / W, cy: cy / H, s: io / W }, ioPx: io, eyes: { R: R, L: L } };
+    var head = [(n.x - cx) / io, (n.y - cy) / io, cx / W, cy / H, io / W];
+    var bR = [g('eyeLookInRight') - g('eyeLookOutRight'), g('eyeLookDownRight') - g('eyeLookUpRight')];
+    var bL = [g('eyeLookOutLeft') - g('eyeLookInLeft'), g('eyeLookDownLeft') - g('eyeLookUpLeft')];
+    var both = [(R.u + L.u) / 2, (R.v + L.v) / 2, (R.lid + L.lid) / 2, bR[0] + bL[0], bR[1] + bL[1]].concat(head);
+    // Per-eye feature sets, for people whose eyes don't point at the same spot (strabismus, one weak eye).
+    // Which blendshape side matches which landmark eye is left to calibration to decide (both pairings are tried).
+    var eR = [R.u, R.v, R.lid], eL = [L.u, L.v, L.lid];
+    var modes = {
+      both: both,
+      R: eR.concat(head), L: eL.concat(head),
+      'R+bR': eR.concat(bR, head), 'R+bL': eR.concat(bL, head),
+      'L+bL': eL.concat(bL, head), 'L+bR': eL.concat(bR, head)
+    };
+    // A real blink closes both eyes; using the max would discard every frame if one eye always looks half-closed.
+    var blink = Math.min(g('eyeBlinkLeft'), g('eyeBlinkRight'));
+    return { f: both, modes: modes, blink: blink, head: { cx: cx / W, cy: cy / H, s: io / W }, ioPx: io, eyes: { R: R, L: L } };
   }
   function expand(f, set) { if (set === 'lin') return f; var u = f[0], v = f[1]; return f.concat([u * u, v * v, u * v]); }
 
@@ -319,7 +331,22 @@ var GR = (function () {
 
   // Calibrate: pick feature set + regularisation per axis by leave-one-point-out cross-validation.
   // Reports systematic error (bias of the averaged prediction at unseen points) and jitter (frame-to-frame spread).
-  function calibrate(samples) {
+  var EYE_MODES = { auto: ['both', 'R', 'L', 'R+bR', 'R+bL', 'L+bL', 'L+bR'], both: ['both'], R: ['R', 'R+bR', 'R+bL'], L: ['L', 'L+bL', 'L+bR'] };
+  // samples: [{modes:{...feature vectors}, x, y, pid}]. Tries each eye mode, keeps the one that predicts unseen dots best.
+  function calibrate(samples, which) {
+    var tried = [];
+    (EYE_MODES[which || 'auto'] || EYE_MODES.auto).forEach(function (mode) {
+      var ss = samples.map(function (s) { return { f: s.modes ? s.modes[mode] : s.f, x: s.x, y: s.y, pid: s.pid }; });
+      var m = calibrate1(ss); m.mode = mode;
+      m.score = Math.sqrt(m.x.rmse * m.x.rmse + m.y.rmse * m.y.rmse);
+      tried.push(m);
+    });
+    tried.sort(function (a, b) { return a.score - b.score; });
+    var best = tried[0];
+    best.compare = tried.map(function (m) { return { mode: m.mode, score: Math.round(m.score) }; });
+    return best;
+  }
+  function calibrate1(samples) {
     var pids = []; samples.forEach(function (s) { if (pids.indexOf(s.pid) < 0) pids.push(s.pid); });
     var sets = ['lin', 'quad'], lams = [0.0003, 0.003, 0.03, 0.3, 3];
     var best = { x: null, y: null };
@@ -353,7 +380,8 @@ var GR = (function () {
     }
     return { x: fit('x'), y: fit('y') };
   }
-  function predictGaze(model, f) {
+  function predictGaze(model, F) {
+    var f = F.modes ? F.modes[model.mode || 'both'] : F;
     return { x: predictRidge(model.x.m, expand(f, model.x.set)), y: predictRidge(model.y.m, expand(f, model.y.set)) };
   }
 
@@ -600,7 +628,8 @@ var S = {
   scroll: store.get('scroll', true),
   drift: store.get('drift', true),
   dot: store.get('dot', false),
-  noise: store.get('noise', 0)
+  noise: store.get('noise', 0),
+  eye: store.get('eye', 'auto')
 };
 var MP_VER = '0.10.14';
 var MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
@@ -629,6 +658,7 @@ function toast(msg, ms) {
 
 // ---------- Settings UI ----------
 function bindSettings() {
+  var ey = $('#sEye'); ey.value = S.eye; ey.onchange = function () { S.eye = ey.value; store.set('eye', S.eye); };
   var f = $('#sFont'), g = $('#sGap'), m = $('#sMode'), d = $('#sDim'), sc = $('#sScroll'), dr = $('#sDrift'), dot = $('#sDot'), nz = $('#sNoise');
   f.value = S.fontSize; g.value = S.lineGap; m.value = S.mode; d.checked = S.dim; sc.checked = S.scroll; dr.checked = S.drift; dot.checked = S.dot; nz.value = S.noise;
   function out() { $('#oFont').textContent = S.fontSize + 'px'; $('#oGap').textContent = (+S.lineGap).toFixed(2); $('#oNoise').textContent = S.noise + 'px'; }
@@ -831,7 +861,7 @@ function onResult(res, t) {
   else if (phase === 'qf') qfCollect(F, t);
   else if (phase === 'read') {
     if (F.blink > 0.5) return;
-    var g = GR.predictGaze(model, F.f);
+    var g = GR.predictGaze(model, F);
     readStep(g, t);
     checkMoved(F, t);
   }
@@ -884,7 +914,7 @@ function calibCollect(F, t) {
   if (!cal || cal.i < 0 || cal.i >= CAL_PTS.length) return;
   var el = t - cal.t0;
   if (el > 0.75 && F.blink < 0.5) {
-    cal.samples.push({ f: F.f, x: cal.px, y: cal.py, pid: cal.i }); cal.n++;
+    cal.samples.push({ f: F.f, modes: F.modes, x: cal.px, y: cal.py, pid: cal.i }); cal.n++;
     cal.heads.push(F.head);
   }
   if ((el > 1.6 && cal.n >= 12) || el > 3.5) calibNext();
@@ -896,10 +926,16 @@ function calibFinish() {
   cal.samples.forEach(function (s) { (by[s.pid] = by[s.pid] || []).push(s); });
   Object.keys(by).forEach(function (pid) {
     var ss = by[pid]; if (ss.length < 4) return;
-    var mu = GR.median(ss.map(function (s) { return s.f[0]; })), mv = GR.median(ss.map(function (s) { return s.f[1]; }));
-    var du = ss.map(function (s) { return Math.abs(s.f[0] - mu); }), dv = ss.map(function (s) { return Math.abs(s.f[1] - mv); });
-    var su = GR.median(du) * 1.4826 + 1e-4, sv = GR.median(dv) * 1.4826 + 1e-4;
-    ss.forEach(function (s, i) { if (du[i] < 3 * su && dv[i] < 3 * sv) keep.push(s); });
+    // keep a sample if it is consistent for at least one eye (one eye may wander on its own)
+    function inl(key) {
+      var a = ss.map(function (s) { return s.modes[key][0]; }), b = ss.map(function (s) { return s.modes[key][1]; });
+      var ma = GR.median(a), mb = GR.median(b);
+      var da = a.map(function (v) { return Math.abs(v - ma); }), db = b.map(function (v) { return Math.abs(v - mb); });
+      var sa = GR.median(da) * 1.4826 + 1e-4, sb = GR.median(db) * 1.4826 + 1e-4;
+      return ss.map(function (s, i) { return da[i] < 3 * sa && db[i] < 3 * sb; });
+    }
+    var okR = inl('R'), okL = inl('L');
+    ss.forEach(function (s, i) { if (okR[i] || okL[i]) keep.push(s); });
   });
   var npts = Object.keys(by).filter(function (k) { return by[k].length >= 4; }).length;
   if (npts < 9 || keep.length < 60) {
@@ -907,7 +943,7 @@ function calibFinish() {
     $('#calibAcc').innerHTML = 'Not enough good samples (face lost or eyes closed too often). Check the lighting and try again.';
     $('#calibRead').disabled = true; return;
   }
-  model = GR.calibrate(keep);
+  model = GR.calibrate(keep, S.eye);
   headRef = {
     cx: GR.median(cal.heads.map(function (h) { return h.cx; })),
     cy: GR.median(cal.heads.map(function (h) { return h.cy; })),
@@ -925,7 +961,11 @@ function showCalibResult() {
     linesOff < 3 ? 'Typical for a webcam. Following the line relies mostly on your return sweeps.' :
     'Rough. Try better light, a steadier device, or recalibrate.';
   if (isPhone && window.innerHeight > window.innerWidth) verdict += ' In portrait the lines are short, which makes tracking much less reliable. Landscape works far better.';
-  $('#calibAcc').innerHTML = 'Estimated error: about <b>' + ex + ' px</b> sideways and <b>' + ey + ' px</b> up/down ' +
+  var names = { both: 'both eyes', R: 'your right eye', L: 'your left eye' }, which = names[(model.mode || 'both').charAt(0) === 'b' ? 'both' : model.mode.charAt(0)];
+  var bothS = (model.compare || []).filter(function (c) { return c.mode === 'both'; })[0];
+  var eyeNote = 'Following <b>' + which + '</b>' + (S.eye === 'auto' ? ' (picked automatically)' : '') + '. ' +
+    (bothS && model.mode !== 'both' && bothS.score > 1.1 * model.score ? 'Using both eyes together would have been off by about ' + bothS.score + ' px vs ' + Math.round(model.score) + ' px. ' : '');
+  $('#calibAcc').innerHTML = eyeNote + '<br>Estimated error: about <b>' + ex + ' px</b> sideways and <b>' + ey + ' px</b> up/down ' +
     '(≈ ' + linesOff.toFixed(1) + ' lines at the current text size), jitter ±' + jx + '/' + jy + ' px.<br><span class="note">' + verdict + '</span>';
 }
 
@@ -941,7 +981,7 @@ function quickFix() {
 }
 function qfCollect(F, t) {
   var el = t - qf.t0;
-  if (el > 0.6 && F.blink < 0.5) { var g = GR.predictGaze(model, F.f); qf.px.push(g.x); qf.py.push(g.y); }
+  if (el > 0.6 && F.blink < 0.5) { var g = GR.predictGaze(model, F); qf.px.push(g.x); qf.py.push(g.y); }
   if ((el > 1.6 && qf.px.length >= 10) || el > 4) {
     $('#qf').style.display = 'none'; phase = 'read';
     if (qf.px.length >= 5) {

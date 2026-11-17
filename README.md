@@ -11,6 +11,10 @@ Everything runs in the browser. Camera frames never leave the device.
 3. **Reading model (HMM)**: the hidden state is the word you're on. Each frame the eye stays put, hops forward 1–3 words, regresses 1–2, or (from the end of a line) makes a return sweep to the start of the next line. The noisy gaze point is weighed against this model over many frames. One bad frame can't move the highlight, but a real return sweep does. The vertical offset is learned while you read.
 4. **Fallbacks**: tap or click a line to set it. Use ↑/↓ (or J/K). **Fix** re-centres with one dot after you move. Big held jumps (skipping ahead several lines) are caught separately.
 
+## Eyes that don't point at the same place
+
+The feature extractor builds separate feature sets for each eye (iris position, eyelids, that eye's blendshapes, head pose) as well as the averaged both-eyes set. Calibration fits every set and keeps the one that best predicts dots it hasn't seen. So with a turned or weak eye, the app follows the eye that actually looks at the dots, and the other eye is ignored. A blink counts only when *both* eyes close, so an eye that always looks half-closed doesn't make every frame get thrown away. With a simulated turned eye (in tests/e2e.py), the old both-eyes approach stayed on the right line 24% of the time; per-eye auto-selection got 98–99%. You can also force an eye in Settings.
+
 ## Honest limits
 
 - A webcam's gaze error is a few centimetres, so the word underline is approximate. The line band is the reliable part.

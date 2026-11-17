@@ -8,6 +8,8 @@ PAGE = 'file://' + sys.argv[1]
 VIEW = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {"width": 1280, "height": 800}
 NOISE = float(sys.argv[3]) if len(sys.argv) > 3 else 0.012   # iris noise in eye-widths (~0.01 = realistic-ish)
 OUT = sys.argv[4] if len(sys.argv) > 4 else '/tmp/e2e'
+BAD = sys.argv[5] if len(sys.argv) > 5 else ''   # 'L' = subject's left eye turned/weak
+EYE = sys.argv[6] if len(sys.argv) > 6 else 'auto'
 
 MOCK = """
 (() => {
@@ -15,7 +17,7 @@ MOCK = """
   const g = () => { const u = 1 - rnd(), v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
   const NOISE = %NOISE%;
   const R = { line: 0, word: 0, until: 0, truthLine: 0, started: false };
-  let wander = [0, 0];
+  let wander = [0, 0]; const bad = [0, 0]; const BAD = '%BAD%';
   function target(t, phase) {
     if (phase === 'calib') {
       const d = document.querySelector('#cdot');
@@ -48,14 +50,17 @@ MOCK = """
     const v = 0.07 * ny + 0.02 * ny * ny + NOISE * 0.8 * g() + wander[1];
     const lm = Array.from({ length: 478 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
     const set = (i, x, y) => { lm[i] = { x: x / 640, y: y / 480, z: 0 }; };
-    const eye = (oc, ic, up, dn, ir, cx) => {
+    // a turned / weak eye: sits off-centre, barely follows the target, and wanders slowly on its own
+    bad[0] = 0.995 * bad[0] + 0.004 * g(); bad[1] = 0.995 * bad[1] + 0.003 * g();
+    const ub = 0.13 + 0.25 * (u - 0.13 * 0) * 0.3 + bad[0] + NOISE * g(), vb = 0.03 + 0.2 * v + bad[1] + NOISE * g();
+    const eye = (oc, ic, up, dn, ir, cx, isBad) => {
       const w = 60; const ax = cx - w / 2, bx = cx + w / 2, cy = 220;
       set(oc, ax, cy); set(ic, bx, cy);
       set(up, cx, cy - 12 + 6 * ny); set(dn, cx, cy + 12);
-      set(ir, cx + u * w, cy + v * w);
+      set(ir, cx + (isBad ? ub : u) * w, cy + (isBad ? vb : v) * w);
     };
-    eye(33, 133, 159, 145, 468, 260);   // image-left eye: outer(33) at left, inner(133) at right
-    eye(362, 263, 386, 374, 473, 380);  // image-right eye: inner(362) at left, outer(263) at right
+    eye(33, 133, 159, 145, 468, 260, BAD === 'R');   // subject's right eye
+    eye(362, 263, 386, 374, 473, 380, BAD === 'L');  // subject's left eye
     set(1, 320, 280);
     const cats = [
       ['eyeLookDownLeft', Math.max(0, ny) * 0.8], ['eyeLookDownRight', Math.max(0, ny) * 0.8],
@@ -63,11 +68,14 @@ MOCK = """
       ['eyeLookInRight', Math.max(0, nx) * 0.6], ['eyeLookOutLeft', Math.max(0, nx) * 0.6],
       ['eyeLookOutRight', Math.max(0, -nx) * 0.6], ['eyeLookInLeft', Math.max(0, -nx) * 0.6],
       ['eyeBlinkLeft', 0.05], ['eyeBlinkRight', 0.05]
-    ].map(([n, s]) => ({ categoryName: n, score: Math.min(1, s + 0.05 * g() * 0.3) }));
+    ].map(([n, s]) => {
+      if (BAD && n.endsWith(BAD === 'L' ? 'Left' : 'Right')) s = n.startsWith('eyeBlink') ? 0.6 : Math.max(0, 0.3 + 0.2 * g());
+      return { categoryName: n, score: Math.min(1, s + 0.05 * g() * 0.3) };
+    });
     return { faceLandmarks: [lm], faceBlendshapes: [{ categories: cats }] };
   } };
 })();
-""".replace('%NOISE%', str(NOISE))
+""".replace('%NOISE%', str(NOISE)).replace('%BAD%', BAD)
 
 with sync_playwright() as p:
     b = p.chromium.launch(executable_path='/usr/bin/google-chrome', args=['--no-sandbox'])
@@ -77,6 +85,7 @@ with sync_playwright() as p:
     pg.on('pageerror', lambda e: errors.append(str(e)))
     pg.on('console', lambda m: errors.append('console.' + m.type + ': ' + m.text) if m.type == 'error' else None)
     pg.add_init_script(MOCK)
+    pg.add_init_script("localStorage.setItem('gr.eye', JSON.stringify('%s'))" % EYE)
     pg.goto(PAGE)
     pg.screenshot(path=OUT + '_home.png')
     pg.click('#sample')
