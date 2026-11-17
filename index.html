@@ -147,6 +147,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
    <div class="row" style="margin-top:0">
     <button class="btn primary" id="goCam">Start with camera</button>
     <button class="btn" id="goSim">Try with mouse / finger</button>
+    <button class="btn" id="goExt" hidden>Use external eye tracker</button>
    </div>
    <p class="note">Camera frames are processed on this device and never leave it. "Mouse / finger" mode lets you test the highlighting without the camera: your pointer stands in for your eyes.</p>
   </section>
@@ -168,6 +169,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <label for="sEye">Eye to follow</label>
     <select id="sEye"><option value="auto">Auto (best at calibration)</option><option value="R">My right eye</option><option value="L">My left eye</option><option value="both">Both eyes</option></select>
     <label for="sNN">Neural gaze model (WebEyeTrack)</label><input id="sNN" type="checkbox">
+    <label for="sExt">External eye tracker address</label><input id="sExt" type="text" placeholder="ws://localhost:8765" style="width:170px;border:1px solid var(--line);border-radius:8px;padding:6px;background:var(--bg)">
     <label for="sRec">Record camera sessions (numbers only)</label><input id="sRec" type="checkbox">
     <label for="sPdf">PDF layout (keep pages, equations, columns)</label><input id="sPdf" type="checkbox">
     <label for="sCal">Calibration style</label>
@@ -699,7 +701,8 @@ var S = {
   calStyle: store.get('calStyle', 'read'),
   pdfLayout: store.get('pdfLayout', true),
   rec: store.get('rec', true),
-  nn: store.get('nn', true)
+  nn: store.get('nn', true),
+  ext: store.get('ext', '')
 };
 var MP_VER = '0.10.14';
 var MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
@@ -728,6 +731,8 @@ function toast(msg, ms) {
 
 // ---------- Settings UI ----------
 function bindSettings() {
+  var sx = $('#sExt'); sx.value = S.ext; $('#goExt').hidden = !S.ext;
+  sx.onchange = function () { S.ext = sx.value.trim(); store.set('ext', S.ext); $('#goExt').hidden = !S.ext; };
   var sn = $('#sNN'); sn.checked = S.nn; sn.onchange = function () { S.nn = sn.checked; store.set('nn', S.nn); };
   var sr = $('#sRec'); sr.checked = S.rec; sr.onchange = function () { S.rec = sr.checked; store.set('rec', S.rec); };
   var sp = $('#sPdf'); sp.checked = S.pdfLayout; sp.onchange = function () { S.pdfLayout = sp.checked; store.set('pdfLayout', S.pdfLayout); };
@@ -1175,6 +1180,45 @@ async function recExport() {
   toast('Downloaded ' + name);
 }
 
+// ---------- External eye tracker (e.g. Tobii) over a local WebSocket ----------
+// A small program on the computer reads the tracker and sends JSON messages:
+//   {"x":0.41,"y":0.33}                      gaze on the screen, 0..1 of the full screen
+//   {"l":[0.40,0.33],"r":[0.43,0.34]}        or per eye (null when that eye isn't tracked)
+// "Eye to follow" in Settings picks l or r; Auto averages the eyes that are valid.
+var ext = { ws: null, last: null, n: 0 };
+function extConnect() {
+  try { if (ext.ws) ext.ws.close(); } catch (e) {}
+  var ws; try { ws = new WebSocket(S.ext); } catch (e) { toast('Bad tracker address: ' + S.ext, 4000); return; }
+  ext.ws = ws; ext.n = 0;
+  ws.onopen = function () { toast('External tracker connected'); };
+  ws.onclose = function () { if (phase === 'read' && mode === 'ext') toast('External tracker disconnected', 4000); };
+  ws.onerror = function () { toast('Could not reach the tracker at ' + S.ext + '. Is the bridge program running?', 5000); };
+  ws.onmessage = function (m) {
+    var d; try { d = JSON.parse(m.data); } catch (e) { return; }
+    var p = null;
+    if (d.l || d.r) {
+      var l = d.l && isFinite(d.l[0]) ? d.l : null, r = d.r && isFinite(d.r[0]) ? d.r : null;
+      p = S.eye === 'L' ? l : S.eye === 'R' ? r : (l && r ? [(l[0] + r[0]) / 2, (l[1] + r[1]) / 2] : l || r);
+    } else if (isFinite(d.x)) p = [d.x, d.y];
+    if (!p || mode !== 'ext' || paused) return;
+    // screen fraction -> page pixels. Browser chrome is guessed; "Fix" removes any remaining offset. Fullscreen is best.
+    var top = (window.outerHeight - window.innerHeight) || 0, sxp = window.screenX || 0, syp = window.screenY || 0;
+    var g = { x: p[0] * screen.width - sxp, y: p[1] * screen.height - syp - top }, tnow = performance.now() / 1000;
+    if (phase === 'qf' && qf) {
+      if (tnow - qf.t0 > 0.6) { qf.px.push(g.x); qf.py.push(g.y); }
+      if (tnow - qf.t0 > 1.8) {
+        $('#qf').style.display = 'none'; phase = 'read';
+        if (qf.px.length >= 5) { ext.bias = { x: qf.x - GR.median(qf.px), y: qf.y - GR.median(qf.py) }; toast('Offset corrected'); }
+      }
+      return;
+    }
+    if (phase !== 'read') return;
+    if (ext.bias) { g.x += ext.bias.x; g.y += ext.bias.y; }
+    ext.last = g; ext.n++;
+    readStep(g, performance.now() / 1000);
+  };
+}
+
 // ---------- Setup screen ----------
 function setupUI(F) {
   var cv = $('#overlay'), sz = frameSize();
@@ -1315,7 +1359,7 @@ function showCalibResult() {
 // ---------- Quick fix (one-dot offset correction) ----------
 var qf = null;
 function quickFix() {
-  if (mode !== 'cam' || !model) { toast('Quick fix needs the camera mode'); return; }
+  if (mode === 'sim' || (mode === 'cam' && !model)) { toast('Quick fix needs the camera or an external tracker'); return; }
   var x = window.innerWidth / 2, y = window.innerHeight * 0.42, el = $('#qf');
   el.querySelector('.d').style.left = x + 'px'; el.querySelector('.d').style.top = y + 'px';
   el.querySelector('.t').style.top = (y + 30) + 'px';
@@ -1350,6 +1394,8 @@ function makeTracker() {
   if (mode === 'cam' && model) {
     o.sigmaX = Math.max(15, model.x.jit); o.sigmaY = Math.max(15, model.y.jit);
     o.errX = Math.max(20, model.x.err); o.errY = Math.max(20, model.y.err);
+  } else if (mode === 'ext') {
+    o.sigmaX = o.sigmaY = 25; o.errX = o.errY = 45;   // dedicated IR trackers: ~0.5-1 degree
   } else {
     var n = S.noise; o.sigmaX = o.sigmaY = Math.max(10, n); o.errX = o.errY = Math.max(15, n * 0.5);
   }
@@ -1428,6 +1474,7 @@ function status() {
   if (paused) { dot.className = 'dot'; txt.textContent = 'Paused'; return; }
   var line = tracker ? (tracker.cur + 1) + '/' + LINES.length : '';
   if (mode === 'sim') { dot.className = 'dot on'; txt.textContent = 'Pointer mode · line ' + line; return; }
+  if (mode === 'ext') { var on = ext.ws && ext.ws.readyState === 1; dot.className = 'dot ' + (on ? 'on' : 'off'); txt.textContent = (on ? 'External tracker' : 'Tracker offline') + ' · line ' + line; return; }
   var face = lastFeat && t - lastFaceT < 0.5;
   dot.className = 'dot ' + (face ? 'on' : 'off');
   txt.textContent = (face ? 'Tracking' : 'No face') + ' · line ' + line + (fps ? ' · ' + fps + 'fps' : '');
@@ -1444,6 +1491,7 @@ $('#goCam').onclick = async function () {
 };
 function ago(ts) { var m = Math.round((Date.now() - ts) / 60000); return m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; }
 $('#goSim').onclick = function () { mode = 'sim'; enterReader(); };
+$('#goExt').onclick = function () { mode = 'ext'; extConnect(); enterReader(); };
 $('#setupBack').onclick = function () { phase = 'home'; show('home'); };
 function calibIntro() {
   $('#calibIntro').innerHTML = S.calStyle === 'dots' ? 'A dot will move to 13 spots. <b>Look at it until it shrinks.</b> Keep your head and the device still.' :
