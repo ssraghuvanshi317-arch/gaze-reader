@@ -167,6 +167,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <select id="sMode"><option value="line">Line band</option><option value="line+words">Line band + word underline</option><option value="words">Word underline only</option></select>
     <label for="sEye">Eye to follow</label>
     <select id="sEye"><option value="auto">Auto (best at calibration)</option><option value="R">My right eye</option><option value="L">My left eye</option><option value="both">Both eyes</option></select>
+    <label for="sNN">Neural gaze model (WebEyeTrack)</label><input id="sNN" type="checkbox">
     <label for="sRec">Record camera sessions (numbers only)</label><input id="sRec" type="checkbox">
     <label for="sPdf">PDF layout (keep pages, equations, columns)</label><input id="sPdf" type="checkbox">
     <label for="sCal">Calibration style</label>
@@ -188,6 +189,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
     <li><b>Tap or click any line</b> to put the highlight there. Keys: <span class="kbd">↓/J</span> next line, <span class="kbd">↑/K</span> previous, <span class="kbd">Space</span> pause, <span class="kbd">F</span> quick fix.</li>
     <li>If you move your head or the device, tap <b>Fix</b> (look at one dot) or recalibrate.</li>
     <li>If your eyes don't point at the same place (a turned or weak eye), leave <b>Eye to follow</b> on Auto: calibration tests each eye on its own and follows the one that tracks the dots. Calibrate with the eye you read with doing the looking.</li>
+    <li>A small neural network (WebEyeTrack's BlazeGaze, MIT licence) also runs during calibration. It's tried on both eyes and on each eye alone, next to the landmark method, and calibration keeps whichever predicts your gaze best.</li>
     <li>Long lines track best. On a phone, <b>turn it sideways</b>; on a laptop, keep the window wide.</li>
     <li>Best results: light on your face (not behind you), device steady, camera at eye level.</li>
     <li>The word underline is approximate: it shows the rough area of the line you're on, not a precise word.</li>
@@ -206,6 +208,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
    <li id="ckFace">Face: –</li>
    <li id="ckDist">Distance: –</li>
    <li id="ckLight">Eyes: –</li>
+   <li id="ckNN">Neural model: –</li>
   </ul>
   <p class="note">Hold the device the way you'll read. Keep your face lit from the front and your whole face in view. During calibration keep your head still and follow the dot with your eyes only.</p>
   <div class="row">
@@ -370,7 +373,9 @@ var GR = (function () {
   function calibrate(samples, which) {
     var tried = [], pr = samples[0].modes && samples[0].modes['R+bR'] ? pairBlendshapes(samples) : null;
     var mR = pr ? 'R+b' + pr.R : 'R', mL = pr ? 'L+b' + pr.L : 'L';
+    var hasNN = samples.every(function (s) { return s.modes && s.modes.nn && isFinite(s.modes.nn[0]) && isFinite(s.modes.nnR[0]) && isFinite(s.modes.nnL[0]); });
     var list = { auto: ['both', mR, mL], both: ['both'], R: [mR], L: [mL] }[which || 'auto'] || ['both', mR, mL];
+    if (hasNN) list = list.concat({ auto: ['nn', 'nnR', 'nnL'], both: ['nn'], R: ['nnR'], L: ['nnL'] }[which || 'auto'] || []);
     list.forEach(function (mode) {
       var ss = samples.map(function (s) { return { f: s.modes ? s.modes[mode] : s.f, x: s.x, y: s.y, pid: s.pid }; });
       var m = calibrate1(ss); m.mode = mode;
@@ -427,7 +432,7 @@ var GR = (function () {
   // Moving closer after calibration: the same eye rotation now points at a spot nearer the straight-ahead point,
   // scaled by (new distance / old distance) = (old face size / new face size).
   function distanceFix(model, F, p) {
-    if (!model.s0 || !model.c || !F.head || !(F.head.s > 0)) return p;
+    if (!model.s0 || !model.c || !F.head || !(F.head.s > 0) || /^nn/.test(model.mode || '')) return p; // the neural model handles distance itself
     var r = clamp(model.s0 / F.head.s, 0.6, 1.6);
     return { x: model.c.x + (p.x - model.c.x) * r, y: model.c.y + (p.y - model.c.y) * r };
   }
@@ -693,7 +698,8 @@ var S = {
   eye: store.get('eye', 'auto'),
   calStyle: store.get('calStyle', 'read'),
   pdfLayout: store.get('pdfLayout', true),
-  rec: store.get('rec', true)
+  rec: store.get('rec', true),
+  nn: store.get('nn', true)
 };
 var MP_VER = '0.10.14';
 var MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
@@ -722,6 +728,7 @@ function toast(msg, ms) {
 
 // ---------- Settings UI ----------
 function bindSettings() {
+  var sn = $('#sNN'); sn.checked = S.nn; sn.onchange = function () { S.nn = sn.checked; store.set('nn', S.nn); };
   var sr = $('#sRec'); sr.checked = S.rec; sr.onchange = function () { S.rec = sr.checked; store.set('rec', S.rec); };
   var sp = $('#sPdf'); sp.checked = S.pdfLayout; sp.onchange = function () { S.pdfLayout = sp.checked; store.set('pdfLayout', S.pdfLayout); };
   var cs = $('#sCal'); cs.value = S.calStyle; cs.onchange = function () { S.calStyle = cs.value; store.set('calStyle', S.calStyle); };
@@ -974,7 +981,7 @@ async function loadLandmarker() {
   var fs = await mod.FilesetResolver.forVisionTasks(MP_BASE + '/wasm');
   function opts(delegate) {
     return { baseOptions: { modelAssetPath: MODEL_URL, delegate: delegate }, runningMode: 'VIDEO', numFaces: 1,
-      outputFaceBlendshapes: true, outputFacialTransformationMatrixes: false };
+      outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true };
   }
   try { return await mod.FaceLandmarker.createFromOptions(fs, opts('GPU')); }
   catch (e) { return await mod.FaceLandmarker.createFromOptions(fs, opts('CPU')); }
@@ -1001,7 +1008,39 @@ async function startCamera() {
     catch (e) { $('#ckModel').innerHTML = '<b class="bad">✗</b> Face model failed to load: ' + esc(e.message) + '. Check your internet connection and reload.'; return false; }
   }
   $('#ckModel').innerHTML = '<b class="good">✓</b> Camera and face model ready';
+  loadNN();
   return true;
+}
+// ---------- Neural gaze model (optional, loads in the background) ----------
+var nn = null, nnState = 'off';
+async function loadNN() {
+  if (nnState !== 'off' || !S.nn || mock) return;
+  nnState = 'loading'; nnStatus();
+  try {
+    if (!window.tf) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+    if (!window.NNGaze) await loadScript('nn.js');
+    var g = new window.NNGaze(); await g.init(location.href.replace(/[^\/]*([?#].*)?$/, ''));
+    nn = g; nnState = 'ready';
+  } catch (e) { nnState = 'failed'; nn = null; console.warn('neural model failed', e); }
+  nnStatus();
+}
+function nnStatus() {
+  var el = $('#ckNN'); if (!el) return;
+  el.innerHTML = !S.nn ? 'Neural model: off (Settings)' : nnState === 'loading' ? 'Neural model: loading (≈2 MB)…' :
+    nnState === 'ready' ? '<b class="good">✓</b> Neural model ready' + (nn && nn.ms ? ' (' + Math.round(nn.ms) + ' ms/frame)' : '') :
+    nnState === 'failed' ? '<b class="bad">✗</b> Neural model unavailable here; using the landmark method only' : 'Neural model: –';
+}
+function nnNeeded() { return nn && (phase === 'setup' || phase === 'calib' || ((phase === 'read' || phase === 'qf') && model && /^nn/.test(model.mode || ''))); }
+function addNN(F, res) {
+  if (!nnNeeded() || !res.facialTransformationMatrixes) return;
+  var o = null;
+  try { o = nn.run(video, res); } catch (e) { console.warn('nn frame failed', e); }
+  if (!o) return;
+  var head = F.modes.both.slice(5);
+  F.modes.nn = [o.both[0], o.both[1], 0, 0, 0].concat(head);
+  F.modes.nnR = [o.R[0], o.R[1], 0, 0, 0].concat(head);
+  F.modes.nnL = [o.L[0], o.L[1], 0, 0, 0].concat(head);
+  F.nn = o;
 }
 function frameSize() { return mock ? { W: mock.W, H: mock.H } : { W: video.videoWidth || 640, H: video.videoHeight || 480 }; }
 
@@ -1036,6 +1075,7 @@ function onResult(res, t) {
   var sz = frameSize();
   var F = GR.features(res.faceLandmarks[0], res.faceBlendshapes && res.faceBlendshapes[0] && res.faceBlendshapes[0].categories, sz.W, sz.H);
   F.lm = res.faceLandmarks[0];
+  if (!mock) addNN(F, res);
   lastFeat = F; lastFaceT = t;
   if (phase === 'setup') setupUI(F);
   else if (phase === 'calib') calibCollect(F, t);
@@ -1085,7 +1125,7 @@ function recStart() {
     device: { ua: navigator.userAgent, screen: [screen.width, screen.height], dpr: window.devicePixelRatio, view: [innerWidth, innerHeight], video: [sz.W, sz.H] },
     settings: JSON.parse(JSON.stringify(S)), pdf: pdfMode() ? PDF.name : null, calib: REC.lastCal,
     model: model ? { mode: model.mode, err: [model.x.err, model.y.err], jit: [model.x.jit, model.y.jit], compare: model.compare, pairing: model.pairing } : null,
-    frameCols: ['t', 'scrollTop', 'gx', 'gy', 'line', 'word', 'blink', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v'],
+    frameCols: ['t', 'scrollTop', 'gx', 'gy', 'line', 'word', 'blink', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v', 'nn.x', 'nn.y', 'nnR.x', 'nnR.y', 'nnL.x', 'nnL.y'],
     layout: [], frames: [], events: []
   };
   recLayout();
@@ -1098,7 +1138,7 @@ function recFrame(t, F, g, out) {
   var R = REC.sess; if (!R || !F || !F.modes) return;
   var a = F.modes['R+bR'], b = F.modes['L+bL'];
   R.frames.push([r4(t), Math.round(readerEl.scrollTop), r4(g.x), r4(g.y), out ? out.line : -1, out ? out.word : -1, r4(F.blink)]
-    .concat(a.map(r4), b.slice(0, 5).map(r4)));
+    .concat(a.map(r4), b.slice(0, 5).map(r4), F.nn ? [F.nn.both[0], F.nn.both[1], F.nn.R[0], F.nn.R[1], F.nn.L[0], F.nn.L[1]].map(r4) : []));
   if (t - REC.saveT > 15) { REC.saveT = t; recSave(); }
 }
 function recEvent(type, data) {
@@ -1109,8 +1149,8 @@ function recSave() { if (REC.sess && REC.sess.frames.length) idb.put(REC.sess).c
 function recCalib(samples) {
   REC.lastCal = {
     t: new Date().toISOString(), style: S.calStyle, view: [cal.W, cal.H],
-    cols: ['pid', 'x', 'y', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v'],
-    samples: samples.map(function (s2) { return [s2.pid, r4(s2.x), r4(s2.y)].concat(s2.modes['R+bR'].map(r4), s2.modes['L+bL'].slice(0, 5).map(r4)); })
+    cols: ['pid', 'x', 'y', 'R.u', 'R.v', 'R.lid', 'bR.h', 'bR.v', 'nose.x', 'nose.y', 'face.cx', 'face.cy', 'face.s', 'L.u', 'L.v', 'L.lid', 'bL.h', 'bL.v', 'nn.x', 'nn.y', 'nnR.x', 'nnR.y', 'nnL.x', 'nnL.y'],
+    samples: samples.map(function (s2) { var m = s2.modes; return [s2.pid, r4(s2.x), r4(s2.y)].concat(m['R+bR'].map(r4), m['L+bL'].slice(0, 5).map(r4), m.nn ? [m.nn[0], m.nn[1], m.nnR[0], m.nnR[1], m.nnL[0], m.nnL[1]].map(r4) : []); })
   };
 }
 async function recRefresh() {
@@ -1150,6 +1190,7 @@ function setupUI(F) {
     var p = F.lm[i]; ctx.beginPath(); ctx.arc(p.x * sz.W, p.y * sz.H, i >= 468 ? 4 : 2.5, 0, 7); ctx.fill();
   });
   $('#ckFace').innerHTML = '<b class="good">✓</b> Face found' + (fps ? ' <span class="note">(' + fps + ' fps)</span>' : '');
+  if (nnState === 'ready') nnStatus();
   var s = F.head.s, eyePx = F.ioPx;
   var distTxt = s > 0.42 ? '<b class="bad">✗</b> Too close. Move back a little.' : eyePx < 45 ? '<b class="bad">✗</b> Too far: eyes are small in the image. Move closer.' : '<b class="good">✓</b> Distance OK';
   $('#ckDist').innerHTML = distTxt;
@@ -1261,7 +1302,9 @@ function showCalibResult() {
     linesOff < 3 ? 'Typical for a webcam. Following the line relies mostly on your return sweeps.' :
     'Rough. Try better light, a steadier device, or recalibrate.';
   if (isPhone && window.innerHeight > window.innerWidth) verdict += ' In portrait the lines are short, which makes tracking much less reliable. Landscape works far better.';
-  var names = { both: 'both eyes', R: 'your right eye', L: 'your left eye' }, which = names[(model.mode || 'both').charAt(0) === 'b' ? 'both' : model.mode.charAt(0)];
+  var md = model.mode || 'both';
+  var which = { both: 'both eyes (landmark method)', nn: 'both eyes (neural model)', nnR: 'your right eye (neural model)', nnL: 'your left eye (neural model)' }[md] ||
+    (md.charAt(0) === 'R' ? 'your right eye (landmark method)' : 'your left eye (landmark method)');
   var bothS = (model.compare || []).filter(function (c) { return c.mode === 'both'; })[0];
   var eyeNote = 'Following <b>' + which + '</b>' + (S.eye === 'auto' ? ' (picked automatically)' : '') + '. ' +
     (bothS && model.mode !== 'both' && bothS.score > 1.1 * model.score ? 'Using both eyes together would have been off by about ' + bothS.score + ' px vs ' + Math.round(model.score) + ' px. ' : '');
