@@ -10,6 +10,7 @@ NOISE = float(sys.argv[3]) if len(sys.argv) > 3 else 0.012   # iris noise in eye
 OUT = sys.argv[4] if len(sys.argv) > 4 else '/tmp/e2e'
 BAD = sys.argv[5] if len(sys.argv) > 5 else ''   # 'L' = subject's left eye turned/weak
 EYE = sys.argv[6] if len(sys.argv) > 6 else 'auto'
+CAL = sys.argv[7] if len(sys.argv) > 7 else 'read'
 
 MOCK = """
 (() => {
@@ -20,6 +21,8 @@ MOCK = """
   let wander = [0, 0]; const bad = [0, 0]; const BAD = '%BAD%';
   function target(t, phase) {
     if (phase === 'calib') {
+      const w = document.querySelector('#cread span.on');
+      if (w) { const r = w.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }
       const d = document.querySelector('#cdot');
       if (d && d.style.display === 'block') { const r = d.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }
       return [innerWidth / 2, innerHeight / 2];
@@ -85,7 +88,7 @@ with sync_playwright() as p:
     pg.on('pageerror', lambda e: errors.append(str(e)))
     pg.on('console', lambda m: errors.append('console.' + m.type + ': ' + m.text) if m.type == 'error' else None)
     pg.add_init_script(MOCK)
-    pg.add_init_script("localStorage.setItem('gr.eye', JSON.stringify('%s'))" % EYE)
+    pg.add_init_script("localStorage.setItem('gr.eye', JSON.stringify('%s')); localStorage.setItem('gr.calStyle', JSON.stringify('%s'))" % (EYE, CAL))
     pg.goto(PAGE)
     pg.screenshot(path=OUT + '_home.png')
     pg.click('#sample')
@@ -94,6 +97,7 @@ with sync_playwright() as p:
     pg.screenshot(path=OUT + '_setup.png')
     assert not pg.is_disabled('#toCalib'), 'calibrate button still disabled'
     pg.click('#toCalib'); pg.click('#calibStart')
+    pg.wait_for_timeout(3000); pg.screenshot(path=OUT + '_calibrating.png')
     pg.wait_for_selector('#calibRes:not([hidden])', timeout=60000)
     print('calibration result:', pg.inner_text('#calibAcc'))
     pg.screenshot(path=OUT + '_calib.png')
